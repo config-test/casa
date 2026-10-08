@@ -1,0 +1,67 @@
+version: 2.1
+
+# One project: the Rails app and its root-level JavaScript package.
+jobs:
+  casa:
+    docker:
+      # Gemfile requires exactly 4.0.6; a floating 4.0 tag can break bundle install.
+      # This variant includes Node, Chrome, and the Rails native build dependencies.
+      - image: cimg/ruby:4.0.6-browsers
+      - image: cimg/postgres:14.24
+        environment:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+    environment:
+      RAILS_ENV: test
+      CI: "true"
+      TEST_MAX_DURATION: "60"
+      DATABASE_HOST: localhost
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_PORT: "5432"
+      BUNDLE_PATH: vendor/bundle
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - casa-v1-{{ arch }}-ruby-4.0.6-{{ checksum "Gemfile.lock" }}-{{ checksum "package-lock.json" }}
+      - run:
+          name: Install dependencies
+          command: |
+            # The bundled Node must satisfy package.json's strict 24.x requirement.
+            node -e 'if (process.versions.node.split(".")[0] !== "24") process.exit(1)'
+            bundle install
+            npm ci
+      - save_cache:
+          key: casa-v1-{{ arch }}-ruby-4.0.6-{{ checksum "Gemfile.lock" }}-{{ checksum "package-lock.json" }}
+          paths:
+            - vendor/bundle
+            - ~/.npm
+      - run:
+          name: Prepare test database
+          command: |
+            # Use pg from the bundle to wait for PostgreSQL; no extra client install.
+            bundle exec ruby -rpg -e '60.times do; begin; PG.connect(host: ENV.fetch("DATABASE_HOST"), user: ENV.fetch("POSTGRES_USER"), password: ENV.fetch("POSTGRES_PASSWORD"), dbname: "postgres").close; exit 0; rescue PG::Error; sleep 1; end; end; abort "PostgreSQL did not become ready"'
+            bundle exec rails db:create db:schema:load
+      - run:
+          name: Build assets
+          command: bundle exec rails assets:precompile
+      - run:
+          name: Test Ruby
+          command: bundle exec rspec
+      - run:
+          name: Test JavaScript
+          command: npm run test -- --runInBand
+      - run:
+          name: Lint Ruby and ERB
+          command: |
+            bundle exec standardrb
+            bundle exec erb_lint --lint-all
+      - run:
+          name: Lint JavaScript
+          command: npm run lint
+
+workflows:
+  starter:
+    jobs:
+      - casa
