@@ -1,0 +1,89 @@
+version: 2.1
+
+# Single project: Rails app with JS assets at the repo root.
+# Ruby 4.0.6 is pinned in the Gemfile / .ruby-version (cimg/ruby:4.0 floats to 4.0.7).
+jobs:
+  build-test-lint:
+    docker:
+      - image: cimg/ruby:4.0.6-browsers
+        environment:
+          RAILS_ENV: test
+          DATABASE_HOST: localhost
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_PORT: "5432"
+          CASA_DATABASE_PASSWORD: password
+          BUNDLE_JOBS: "4"
+          BUNDLE_RETRY: "3"
+      - image: cimg/postgres:14.24
+        environment:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_HOST_AUTH_METHOD: trust
+    steps:
+      - checkout
+
+      - restore_cache:
+          name: Restore gem cache
+          keys:
+            - gems-v1-{{ checksum "Gemfile.lock" }}
+
+      - restore_cache:
+          name: Restore npm cache
+          keys:
+            - npm-v1-{{ checksum "package-lock.json" }}
+
+      - run:
+          name: Install Ruby dependencies
+          command: |
+            gem install bundler -v 4.0.6 --conservative
+            bundle config set --local path vendor/bundle
+            bundle check || bundle install
+
+      - run:
+          name: Install npm dependencies
+          command: npm ci
+
+      - save_cache:
+          name: Save gem cache
+          key: gems-v1-{{ checksum "Gemfile.lock" }}
+          paths:
+            - vendor/bundle
+
+      - save_cache:
+          name: Save npm cache
+          key: npm-v1-{{ checksum "package-lock.json" }}
+          paths:
+            - ~/.npm
+
+      - run:
+          name: Wait for Postgres
+          command: dockerize -wait tcp://localhost:5432 -timeout 1m
+
+      - run:
+          name: Build
+          command: |
+            npm run build
+            npm run build:css
+            bundle exec rake db:create db:schema:load
+            bundle exec rails assets:precompile
+
+      - run:
+          name: Test
+          no_output_timeout: 20m
+          command: |
+            npm run test
+            bin/rails spec
+
+      - run:
+          name: Lint
+          command: |
+            bundle exec standardrb
+            bundle exec erb_lint --lint-all
+            npm run lint
+            bundle exec rake factory_bot:lint
+
+workflows:
+  build-test-lint:
+    jobs:
+      - build-test-lint
