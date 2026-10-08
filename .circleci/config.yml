@@ -1,0 +1,358 @@
+version: 2.1
+
+# Mirrors the repository's existing GitHub Actions workflows (.github/workflows).
+# Those workflows are the source of truth for what CI does here; see
+# .circleci/README-translation.md for the items that could not be translated 1:1.
+#
+# Versions are taken from the repo's own manifests:
+#   Ruby   4.0.6   (.ruby-version, .tool-versions, Gemfile.lock "RUBY VERSION")
+#   Node   24.13.0 (.tool-versions; package.json engines "24.x"; .nvmrc lts/krypton)
+#   Postgres 14.24 (service image used by .github/workflows/rspec.yml)
+
+executors:
+  ruby:
+    docker:
+      - image: cimg/ruby:4.0.6
+    working_directory: ~/casa
+
+  # Ruby + Postgres, for the jobs that need a database.
+  ruby_db:
+    docker:
+      - image: cimg/ruby:4.0.6
+      - image: postgres:14.24
+        environment:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_HOST_AUTH_METHOD: trust
+    working_directory: ~/casa
+
+  # Ruby + headless Chrome + Postgres, for the RSpec suite. spec/support/capybara.rb
+  # uses :selenium_chrome_headless (a local browser) whenever DOCKER is unset, so
+  # the -browsers image variant is required.
+  ruby_browsers_db:
+    docker:
+      - image: cimg/ruby:4.0.6-browsers
+      - image: postgres:14.24
+        environment:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_HOST_AUTH_METHOD: trust
+    working_directory: ~/casa
+
+  node:
+    docker:
+      - image: cimg/node:24.13.0
+    working_directory: ~/casa
+
+  yamllint:
+    docker:
+      - image: cimg/python:3.13
+    working_directory: ~/casa
+
+commands:
+  ensure_libpq:
+    description: Install libpq-dev if the image does not already provide it.
+    steps:
+      - run:
+          name: Install PostgreSQL client headers
+          command: |
+            if ! dpkg -s libpq-dev >/dev/null 2>&1; then
+              sudo apt-get update -yqq
+              sudo apt-get install -yqq libpq-dev
+            fi
+
+  bundle_install:
+    description: Restore, install and cache gems keyed on Gemfile.lock.
+    steps:
+      - restore_cache:
+          keys:
+            - v1-gems-{{ checksum "Gemfile.lock" }}
+            - v1-gems-
+      - run:
+          name: bundle install
+          command: |
+            bundle config set --local path vendor/bundle
+            bundle install --jobs=4 --retry=3
+            bundle clean --force
+      - save_cache:
+          key: v1-gems-{{ checksum "Gemfile.lock" }}
+          paths:
+            - vendor/bundle
+
+  setup_node:
+    description: >-
+      Select the Node version pinned in .tool-versions. package.json sets
+      engines.node to 24.x and .npmrc sets engine-strict=true, so npm ci fails
+      on any other major version.
+    steps:
+      - run:
+          name: Install Node 24.13.0
+          command: |
+            export NVM_DIR="${NVM_DIR:-/opt/circleci/.nvm}"
+            if [ -s "$NVM_DIR/nvm.sh" ]; then
+              # shellcheck disable=SC1091
+              . "$NVM_DIR/nvm.sh"
+              nvm install 24.13.0
+              nvm alias default 24.13.0
+              {
+                echo "export NVM_DIR=\"$NVM_DIR\""
+                echo '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"'
+              } >> "$BASH_ENV"
+            fi
+            node --version
+            npm --version
+
+  npm_install:
+    description: Restore, install and cache node_modules keyed on package-lock.json.
+    steps:
+      - restore_cache:
+          keys:
+            - v1-npm-{{ checksum "package-lock.json" }}
+            - v1-npm-
+      - run:
+          name: npm ci
+          command: npm ci
+      - save_cache:
+          key: v1-npm-{{ checksum "package-lock.json" }}
+          paths:
+            - ~/.npm
+
+  wait_for_postgres:
+    description: Block until the Postgres service container accepts connections.
+    steps:
+      - run:
+          name: Wait for PostgreSQL
+          command: |
+            for _ in $(seq 1 30); do
+              if pg_isready -h localhost -p 5432 -U postgres; then
+                exit 0
+              fi
+              sleep 2
+            done
+            echo "PostgreSQL did not become ready in time"
+            exit 1
+
+jobs:
+  # .github/workflows/rspec.yml
+  rspec:
+    executor: ruby_browsers_db
+    environment:
+      RAILS_ENV: test
+      TEST_MAX_DURATION: 60
+      PARALLEL_TEST_PROCESSORS: 4
+      DATABASE_HOST: localhost
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      CASA_DATABASE_PASSWORD: password
+      POSTGRES_HOST_AUTH_METHOD: trust
+      RUN_SIMPLECOV: true
+    steps:
+      - checkout
+      - ensure_libpq
+      - bundle_install
+      - setup_node
+      - npm_install
+      - restore_cache:
+          keys:
+            - v1-parallel-runtime-{{ .Branch }}-
+            - v1-parallel-runtime-main-
+      - wait_for_postgres
+      - run:
+          name: Build app (databases + assets)
+          command: |
+            bundle exec rake parallel:create parallel:load_schema
+            bundle exec rails assets:precompile
+      - run:
+          name: Run rspec
+          command: |
+            group_by=filesize
+            if [ -s tmp/parallel_runtime_rspec.log ]; then
+              group_by=runtime
+            fi
+            RUBYOPT='-W:no-deprecated -W:no-experimental' \
+              bundle exec parallel_test spec --type rspec -n 4 \
+              --group-by "$group_by"
+      - run:
+          name: Combine runtime logs
+          command: |
+            runtime_logs=(tmp/parallel_runtime_rspec_worker*.log)
+            if [ "${#runtime_logs[@]}" -ne "$PARALLEL_TEST_PROCESSORS" ]; then
+              echo "Expected $PARALLEL_TEST_PROCESSORS runtime logs," \
+                "found ${#runtime_logs[@]}"
+              exit 1
+            fi
+            cat "${runtime_logs[@]}" > tmp/parallel_runtime_rspec.log
+      - save_cache:
+          key: v1-parallel-runtime-{{ .Branch }}-{{ .Revision }}
+          paths:
+            - tmp/parallel_runtime_rspec.log
+      - run:
+          name: Merge coverage
+          command: |
+            bundle exec ruby -rsimplecov -e 'resultsets = Dir["coverage/parallel*/.resultset.json"]; abort "Expected 4 SimpleCov resultsets, found #{resultsets.size}" unless resultsets.size == 4; SimpleCov.collate(resultsets)'
+      - run:
+          name: Report coverage to qlty
+          when: always
+          command: |
+            # The GitHub Actions workflow uploads coverage via qltysh/qlty-action
+            # using the QLTY_COVERAGE_TOKEN secret. No uploader is installed here
+            # on purpose -- wire this up yourself and set QLTY_COVERAGE_TOKEN as a
+            # CircleCI project environment variable (or context).
+            if [ -z "${QLTY_COVERAGE_TOKEN:-}" ]; then
+              echo "QLTY_COVERAGE_TOKEN is not set -- skipping coverage upload."
+              echo "Coverage is still stored as a build artifact."
+            else
+              echo "QLTY_COVERAGE_TOKEN is set, but no uploader is configured."
+              echo "Add the qlty CLI invocation here."
+            fi
+      - store_test_results:
+          path: tmp/reports
+      - store_artifacts:
+          path: tmp/reports
+          destination: rspec-reports
+      - store_artifacts:
+          path: coverage
+          destination: coverage
+      - store_artifacts:
+          path: tmp/capybara
+          destination: selenium-screenshots
+      - store_artifacts:
+          path: tmp/failing_specs.log
+          destination: failing_specs.log
+
+  # .github/workflows/ruby_lint.yml
+  ruby_lint:
+    executor: ruby
+    steps:
+      - checkout
+      - ensure_libpq
+      - bundle_install
+      - run:
+          name: standardrb
+          command: bundle exec standardrb
+
+  # .github/workflows/erb_lint.yml
+  erb_lint:
+    executor: ruby
+    steps:
+      - checkout
+      - ensure_libpq
+      - bundle_install
+      - run:
+          name: erb_lint
+          command: bundle exec erb_lint --lint-all
+
+  # .github/workflows/security.yml
+  brakeman:
+    executor: ruby
+    steps:
+      - checkout
+      - ensure_libpq
+      - bundle_install
+      - run:
+          name: brakeman
+          command: bundle exec brakeman
+
+  # .github/workflows/spec_checker.yml
+  spec_checker:
+    executor: ruby
+    steps:
+      - checkout
+      - ensure_libpq
+      - bundle_install
+      - run:
+          name: rake test_checker
+          command: bundle exec rake test_checker
+
+  # .github/workflows/factory_bot_lint.yml
+  factory_bot_lint:
+    executor: ruby_db
+    environment:
+      RAILS_ENV: test
+      DATABASE_HOST: localhost
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      CASA_DATABASE_PASSWORD: password
+      POSTGRES_HOST_AUTH_METHOD: trust
+      PGHOST: localhost
+      PGUSER: postgres
+    steps:
+      - checkout
+      - ensure_libpq
+      - bundle_install
+      - wait_for_postgres
+      - run:
+          name: factory_bot:lint
+          command: |
+            bundle exec rake db:create
+            bundle exec rake db:schema:load
+            bundle exec rake factory_bot:lint
+
+  # .github/workflows/rake-after_party.yml
+  after_party:
+    executor: ruby_db
+    environment:
+      RAILS_ENV: test
+      DATABASE_HOST: localhost
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      CASA_DATABASE_PASSWORD: password
+      POSTGRES_HOST_AUTH_METHOD: trust
+      PGHOST: localhost
+      PGUSER: postgres
+    steps:
+      - checkout
+      - ensure_libpq
+      - bundle_install
+      - wait_for_postgres
+      - run:
+          name: rake after_party:run
+          command: |
+            bundle exec rake db:create
+            bundle exec rake db:schema:load
+            bundle exec rake after_party:run
+
+  # .github/workflows/npm_lint_and_test.yml
+  npm_lint_and_test:
+    executor: node
+    steps:
+      - checkout
+      - npm_install
+      - run:
+          name: npm run lint
+          command: npm run lint
+      - run:
+          name: npm run test
+          command: npm run test
+
+  # .github/workflows/yaml_lint.yml (ibiqlik/action-yamllint -> yamllint CLI).
+  # yamllint auto-discovers the repo's .yamllint.yml.
+  yaml_lint:
+    executor: yamllint
+    steps:
+      - checkout
+      - run:
+          name: Install yamllint
+          command: pip install --user yamllint
+      - run:
+          name: yamllint
+          command: yamllint .
+
+workflows:
+  ci:
+    jobs:
+      - rspec
+      - ruby_lint
+      - erb_lint
+      - brakeman
+      - spec_checker
+      - factory_bot_lint
+      - after_party
+      - npm_lint_and_test
+      - yaml_lint
