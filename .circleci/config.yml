@@ -1,0 +1,123 @@
+version: 2.1
+
+orbs:
+  node: circleci/node@7.1.0
+
+jobs:
+  # Rails app: build assets, run RSpec, run the Ruby/ERB linters.
+  ruby:
+    docker:
+      - image: cimg/ruby:4.0.6-browsers
+        environment:
+          RAILS_ENV: test
+          DATABASE_HOST: localhost
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_PORT: 5432
+          CASA_DATABASE_PASSWORD: password
+          TEST_MAX_DURATION: 60
+          RUBYOPT: -W:no-deprecated -W:no-experimental
+      - image: postgres:14.24
+        environment:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: casa_test
+    steps:
+      - checkout
+
+      - restore_cache:
+          keys:
+            - gems-v1-{{ checksum "Gemfile.lock" }}
+            - gems-v1-
+      - run:
+          name: Install gems
+          command: |
+            bundle config set --local path vendor/bundle
+            bundle install --jobs=4 --retry=3
+      - save_cache:
+          key: gems-v1-{{ checksum "Gemfile.lock" }}
+          paths:
+            - vendor/bundle
+
+      # .npmrc sets engine-strict=true and package.json requires node 24.x,
+      # so pin Node explicitly rather than relying on the image default.
+      - node/install:
+          node-version: "24.13.0"
+      - restore_cache:
+          keys:
+            - npm-v1-{{ checksum "package-lock.json" }}
+            - npm-v1-
+      - run:
+          name: Install npm packages
+          command: npm ci
+      - save_cache:
+          key: npm-v1-{{ checksum "package-lock.json" }}
+          paths:
+            - ~/.npm
+
+      - run:
+          name: Wait for Postgres
+          command: |
+            for _ in $(seq 1 30); do
+              nc -z localhost 5432 && echo "postgres up" && exit 0
+              sleep 1
+            done
+            echo "postgres never came up" && exit 1
+      - run:
+          name: Prepare test database
+          command: bundle exec rails db:create db:schema:load
+
+      # assets:precompile also runs `npm run build` / `npm run build:css`
+      # via jsbundling-rails and cssbundling-rails. spec/rails_helper.rb
+      # aborts if app/assets/builds is empty, so this must run before RSpec.
+      - run:
+          name: Build assets
+          command: bundle exec rails assets:precompile
+
+      - run:
+          name: RSpec
+          command: bundle exec rspec
+
+      - run:
+          name: Lint Ruby (standardrb)
+          command: bundle exec standardrb
+      - run:
+          name: Lint ERB (erb_lint)
+          command: bundle exec erb_lint --lint-all
+
+      - store_artifacts:
+          path: tmp/screenshots
+          destination: capybara-screenshots
+
+  # Frontend bundle: esbuild build, Jest tests, StandardJS lint.
+  javascript:
+    docker:
+      - image: cimg/node:24.13
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - npm-v1-{{ checksum "package-lock.json" }}
+            - npm-v1-
+      - run:
+          name: Install npm packages
+          command: npm ci
+      - save_cache:
+          key: npm-v1-{{ checksum "package-lock.json" }}
+          paths:
+            - ~/.npm
+      - run:
+          name: Build JS bundles
+          command: npm run build
+      - run:
+          name: Jest
+          command: npm run test
+      - run:
+          name: Lint JS (standard)
+          command: npm run lint
+
+workflows:
+  build-test-lint:
+    jobs:
+      - ruby
+      - javascript
