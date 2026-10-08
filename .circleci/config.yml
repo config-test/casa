@@ -1,0 +1,98 @@
+version: 2.1
+
+jobs:
+  rspec:
+    docker:
+      - image: cimg/ruby:4.0.6-browsers
+        environment:
+          RAILS_ENV: test
+          # Per-example timeout enforced in spec/rails_helper.rb; unset means no timeout.
+          TEST_MAX_DURATION: 60
+          DATABASE_HOST: localhost
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_PORT: 5432
+      - image: postgres:14.24
+        environment:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+    steps:
+      - checkout
+
+      - restore_cache:
+          keys:
+            - casa-bundler-v1-{{ checksum "Gemfile.lock" }}
+      - run:
+          name: Install gems
+          command: |
+            bundle config set --local path vendor/bundle
+            bundle install --jobs=4 --retry=3
+      - save_cache:
+          key: casa-bundler-v1-{{ checksum "Gemfile.lock" }}
+          paths:
+            - vendor/bundle
+
+      - restore_cache:
+          keys:
+            - casa-npm-ruby-v1-{{ checksum "package-lock.json" }}
+      - run:
+          name: Install JS dependencies
+          command: npm ci
+      - save_cache:
+          key: casa-npm-ruby-v1-{{ checksum "package-lock.json" }}
+          paths:
+            - node_modules
+
+      - run:
+          name: Wait for PostgreSQL
+          command: dockerize -wait tcp://localhost:5432 -timeout 1m
+
+      - run:
+          name: Load test schema
+          command: bundle exec rails db:test:prepare
+
+      - run:
+          name: Build assets
+          # spec/rails_helper.rb aborts unless app/assets/builds is populated.
+          command: bundle exec rails assets:precompile
+
+      - run:
+          name: Run RSpec
+          command: |
+            bundle exec rspec \
+              --format progress \
+              --format RspecJunitFormatter \
+              --out tmp/test-results/rspec/results.xml
+
+      - store_test_results:
+          path: tmp/test-results
+      - store_artifacts:
+          path: tmp/screenshots
+          destination: capybara-screenshots
+
+  jest:
+    docker:
+      - image: cimg/node:24.13
+    steps:
+      - checkout
+
+      - restore_cache:
+          keys:
+            - casa-npm-node-v1-{{ checksum "package-lock.json" }}
+      - run:
+          name: Install JS dependencies
+          command: npm ci
+      - save_cache:
+          key: casa-npm-node-v1-{{ checksum "package-lock.json" }}
+          paths:
+            - node_modules
+
+      - run:
+          name: Run Jest
+          command: npm run test
+
+workflows:
+  test:
+    jobs:
+      - rspec
+      - jest
