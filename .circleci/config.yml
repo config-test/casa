@@ -1,0 +1,136 @@
+version: 2.1
+
+# Starter pipeline for CASA (Rails 8.1 + Hotwire/ESBuild).
+# Two jobs, mirroring the two toolchains the repo's existing CI tests:
+#   - rails:      bundle + rspec + standardrb/erb_lint/factory_bot:lint
+#   - javascript: npm + jest + standardjs
+# Deliberately left out for now: parallelism, matrices, other OSes, deploy.
+
+jobs:
+  rails:
+    docker:
+      # Gemfile pins `ruby "4.0.6"` exactly, so the patch-level tag is required:
+      # cimg/ruby:4.0 currently resolves to 4.0.7 and bundler would refuse to run.
+      # The `-browsers` variant ships Chrome + chromedriver for the Capybara system
+      # specs, and the Node LTS (24.x) that assets:precompile needs.
+      - image: cimg/ruby:4.0.6-browsers
+        environment:
+          RAILS_ENV: test
+          DATABASE_HOST: localhost
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_PORT: 5432
+      - image: cimg/postgres:14.24
+        environment:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: casa_test
+    steps:
+      - checkout
+
+      - restore_cache:
+          keys:
+            - v1-casa-gems-{{ checksum "Gemfile.lock" }}
+            - v1-casa-gems-
+      - run:
+          name: Install gems
+          command: |
+            bundle config set --local path vendor/bundle
+            bundle install --jobs=4 --retry=3
+      - save_cache:
+          key: v1-casa-gems-{{ checksum "Gemfile.lock" }}
+          paths:
+            - vendor/bundle
+
+      - restore_cache:
+          keys:
+            - v1-casa-npm-{{ checksum "package-lock.json" }}
+            - v1-casa-npm-
+      - run:
+          name: Install JS packages
+          command: npm ci
+      - save_cache:
+          key: v1-casa-npm-{{ checksum "package-lock.json" }}
+          paths:
+            - ~/.npm
+
+      - run:
+          name: Wait for PostgreSQL
+          command: |
+            for _ in $(seq 1 60); do
+              if (exec 3<>/dev/tcp/localhost/5432) 2>/dev/null; then
+                echo "PostgreSQL is up"
+                exit 0
+              fi
+              sleep 1
+            done
+            echo "PostgreSQL did not become ready in 60s"
+            exit 1
+
+      - run:
+          name: Load test schema
+          command: bundle exec rails db:create db:schema:load
+
+      - run:
+          name: Build assets
+          command: bundle exec rails assets:precompile
+
+      - run:
+          name: RSpec
+          command: bundle exec rspec
+
+      - run:
+          name: standardrb
+          command: bundle exec standardrb
+
+      - run:
+          name: erb_lint
+          command: bundle exec erb_lint --lint-all
+
+      - run:
+          name: factory_bot:lint
+          command: bundle exec rake factory_bot:lint
+
+      # Capybara saves a screenshot + HTML dump for every failing system spec.
+      - store_artifacts:
+          path: tmp/screenshots
+          destination: capybara-screenshots
+          when: on_fail
+
+  javascript:
+    docker:
+      # package.json sets engines.node "24.x" and .npmrc sets engine-strict=true,
+      # so the image has to be on Node 24. .tool-versions asks for 24.13.0.
+      - image: cimg/node:24.13
+    steps:
+      - checkout
+
+      - restore_cache:
+          keys:
+            - v1-casa-npm-{{ checksum "package-lock.json" }}
+            - v1-casa-npm-
+      - run:
+          name: Install JS packages
+          command: npm ci
+      - save_cache:
+          key: v1-casa-npm-{{ checksum "package-lock.json" }}
+          paths:
+            - ~/.npm
+
+      - run:
+          name: Build JS bundle
+          command: npm run build
+
+      - run:
+          name: Jest
+          command: npm run test
+
+      - run:
+          name: standardjs
+          command: npm run lint
+
+workflows:
+  build-and-test:
+    jobs:
+      - rails
+      - javascript
