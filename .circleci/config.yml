@@ -1,0 +1,81 @@
+# CircleCI starter for the CASA Rails app (Ruby + Node at repo root).
+# One project; expand with matrices/deploy later as needed.
+version: 2.1
+
+jobs:
+  build-test-lint:
+    docker:
+      # Gemfile / .ruby-version pin ruby 4.0.6 exactly; floating cimg/ruby:4.0
+      # currently ships 4.0.7 and fails Bundler's version check. -browsers includes
+      # Node 24.x (matches package.json engines) and Chrome for system specs.
+      - image: cimg/ruby:4.0.6-browsers
+        environment:
+          RAILS_ENV: test
+          BUNDLE_PATH: vendor/bundle
+          BUNDLE_JOBS: "4"
+          BUNDLE_RETRY: "3"
+          DATABASE_HOST: localhost
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_PORT: "5432"
+          CASA_DATABASE_PASSWORD: password
+          CI: "true"
+      - image: cimg/postgres:14.24
+        environment:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+
+    steps:
+      - checkout
+
+      - restore_cache:
+          name: Restore dependency cache
+          keys:
+            - v1-deps-{{ checksum "Gemfile.lock" }}-{{ checksum "package-lock.json" }}
+            - v1-deps-{{ checksum "Gemfile.lock" }}-
+
+      - run:
+          name: Install Ruby gems
+          command: bundle install
+
+      - run:
+          name: Install npm packages
+          command: npm ci
+
+      - save_cache:
+          name: Save dependency cache
+          key: v1-deps-{{ checksum "Gemfile.lock" }}-{{ checksum "package-lock.json" }}
+          paths:
+            - vendor/bundle
+            - ~/.npm
+
+      - run:
+          name: Wait for Postgres
+          command: dockerize -wait tcp://localhost:5432 -timeout 1m
+
+      - run:
+          name: Build
+          command: |
+            bundle exec rake db:create db:schema:load
+            npm run build
+            npm run build:css
+
+      - run:
+          name: Test
+          no_output_timeout: 20m
+          command: |
+            bin/rails spec
+            npm run test
+
+      - run:
+          name: Lint
+          command: |
+            bundle exec standardrb
+            bundle exec erb_lint --lint-all
+            npm run lint
+            bundle exec rake factory_bot:lint
+
+workflows:
+  main:
+    jobs:
+      - build-test-lint
