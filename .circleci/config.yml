@@ -1,0 +1,77 @@
+version: 2.1
+
+jobs:
+  casa:
+    docker:
+      # One root Rails project, including its JavaScript assets and Jest suite.
+      # Pin the 4.0.6 browsers image: Gemfile requires exactly Ruby 4.0.6.
+      # The browsers variant includes Node 24, Chrome, and PostgreSQL libraries.
+      - image: cimg/ruby:4.0-browsers@sha256:a4f28aee01db59e7538cea745094e5e3dd1d5fb102bb66cc464a57ad45e7ce37
+      - image: postgres:14.24
+        environment:
+          POSTGRES_USER: postgres
+          # Disposable local test database credentials, not a production secret.
+          POSTGRES_PASSWORD: password
+    environment:
+      RAILS_ENV: test
+      CI: "true"
+      TEST_MAX_DURATION: "60"
+      DATABASE_HOST: localhost
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_PORT: "5432"
+      BUNDLE_PATH: vendor/bundle
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-casa-ruby4.0.6-node24-{{ arch }}-{{ checksum "Gemfile.lock" }}-{{ checksum "package-lock.json" }}
+      - run:
+          name: Install Ruby and JavaScript dependencies
+          command: |
+            ruby --version
+            node --version
+            node -e 'if (process.versions.node.split(".")[0] !== "24") process.exit(1)'
+            bundle install --jobs 4 --retry 3
+            npm ci
+      - save_cache:
+          key: v1-casa-ruby4.0.6-node24-{{ arch }}-{{ checksum "Gemfile.lock" }}-{{ checksum "package-lock.json" }}
+          paths:
+            - vendor/bundle
+            - ~/.npm
+      - run:
+          name: Prepare test database
+          command: |
+            # Wait for the service container before creating the test database.
+            bundle exec ruby -rpg -rtimeout -e '
+              Timeout.timeout(60) do
+                loop do
+                  begin
+                    PG.connect(host: ENV.fetch("DATABASE_HOST"), user: ENV.fetch("POSTGRES_USER"), password: ENV.fetch("POSTGRES_PASSWORD"), dbname: "postgres").close
+                    break
+                  rescue PG::ConnectionBad
+                    sleep 1
+                  end
+                end
+              end'
+            bundle exec rake db:create db:schema:load
+      - run:
+          name: Build application assets
+          command: bundle exec rails assets:precompile
+      - run:
+          name: Test Ruby and JavaScript
+          command: |
+            bundle exec rspec
+            npm run test -- --runInBand
+      - run:
+          name: Lint Ruby, ERB, factories, and JavaScript
+          command: |
+            bundle exec standardrb
+            bundle exec erb_lint --lint-all
+            bundle exec rake factory_bot:lint
+            npm run lint
+
+workflows:
+  starter:
+    jobs:
+      - casa
